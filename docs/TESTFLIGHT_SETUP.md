@@ -73,30 +73,16 @@ Copy the output **directly into the GitHub Actions secret**, never into a commit
 
 For **my server (Tailscale)** builds, the original `TS_AUTHKEY` and `GAME_SERVER_URL` secrets are also needed; select **uploaded with the website builder** to reuse the existing `build-inputs` branch instead.
 
-## 4. Add a real App Store app icon
+## 4. App icon (already configured)
 
-This repository did not contain a complete `AppIcon.appiconset` at the time this workflow was created. TestFlight / App Store Connect requires appropriate app-icon metadata and resources.
+The approved V-on-sunset icon is now committed in the Xcode asset catalog:
 
-Add your own **1024 x 1024 opaque PNG** to:
-`app/App/Assets.xcassets/AppIcon.appiconset/AppIcon-1024.png`
+- `app/App/Assets.xcassets/AppIcon.appiconset/IconSource.jpg` — compressed copy for the cloud build.
+- `app/App/Assets.xcassets/AppIcon.appiconset/Contents.json` — references the generated 1024x1024 PNG.
 
-Add `app/App/Assets.xcassets/AppIcon.appiconset/Contents.json`:
+The TestFlight workflow runs `sips` on the macOS runner to create the required opaque `AppIcon-1024.png` **before** it invokes XcodeGen/Xcode. You do not need to supply icon metadata manually.
 
-```json
-{
-  "images": [
-    {
-      "filename": "AppIcon-1024.png",
-      "idiom": "universal",
-      "platform": "ios",
-      "size": "1024x1024"
-    }
-  ],
-  "info": { "author": "xcode", "version": 1 }
-}
-```
-
-Use an icon you have permission to distribute. Before it is present, the workflow intentionally stops early with an actionable error.
+The original artwork was generated at higher resolution; the repository copy is optimized for compact transfer and will be upscaled to 1024x1024 during the build. For the sharpest possible artwork, replace `IconSource.jpg` with a high-resolution source image and adapt the conversion step, or commit a full-resolution `AppIcon-1024.png` and remove the conversion step. This icon is unofficial fan-project artwork, not licensed Rockstar Games branding.
 
 ## 5. Run your build from GitHub
 
