@@ -1,0 +1,241 @@
+# Separate from build-ipa.yml: builds a signed App Store Connect IPA and uploads it
+# only when manually started. Never publishes the engine-containing IPA as a release.
+name: Internal TestFlight
+
+on:
+  workflow_dispatch:
+    inputs:
+      game_files:
+        description: Where to get the build inputs
+        type: choice
+        required: true
+        default: uploaded with the website builder
+        options:
+          - uploaded with the website builder
+          - my server (Tailscale)
+
+permissions:
+  contents: read
+
+concurrency:
+  group: testflight-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build-and-upload:
+    name: Build and upload to TestFlight
+    runs-on: macos-26
+    timeout-minutes: 240
+    env:
+      FROM_UPLOAD: ${{ inputs.game_files == 'uploaded with the website builder' }}
+      BUNDLE_ID: ${{ vars.APP_BUNDLE_ID }}
+      TEAM_ID: ${{ vars.APPLE_TEAM_ID }}
+      SERVER: ${{ secrets.GAME_SERVER_URL }}
+    steps:
+      - name: Check private repository and Apple configuration
+        env:
+          APPSTORE_ISSUER_ID: ${{ vars.APPSTORE_ISSUER_ID }}
+          APPSTORE_API_KEY_ID: ${{ vars.APPSTORE_API_KEY_ID }}
+          APPSTORE_API_PRIVATE_KEY: ${{ secrets.APPSTORE_API_PRIVATE_KEY }}
+          APPSTORE_CERTIFICATES_FILE_BASE64: ${{ secrets.APPSTORE_CERTIFICATES_FILE_BASE64 }}
+          APPSTORE_CERTIFICATES_PASSWORD: ${{ secrets.APPSTORE_CERTIFICATES_PASSWORD }}
+        run: |
+          if [ "${{ github.event.repository.private }}" != "true" ]; then
+            echo "::error::Use a private repository. The compiled app contains code derived from your personal game inputs."
+            exit 1
+          fi
+          for name in BUNDLE_ID TEAM_ID APPSTORE_ISSUER_ID APPSTORE_API_KEY_ID APPSTORE_API_PRIVATE_KEY APPSTORE_CERTIFICATES_FILE_BASE64 APPSTORE_CERTIFICATES_PASSWORD; do
+            if [ -z "${!name}" ]; then
+              echo "::error::Missing GitHub Actions secret/variable: $name"
+              exit 1
+            fi
+          done
+          if [ "$FROM_UPLOAD" != "true" ] && [ -z "$SERVER" ]; then
+            echo "::error::Tailscale mode requires GAME_SERVER_URL."
+            exit 1
+          fi
+
+      - uses: actions/checkout@v4
+
+      - name: Check App Store icon prerequisites
+        run: |
+          if [ ! -f app/App/Assets.xcassets/AppIcon.appiconset/Contents.json ]; then
+            echo "::error::Add app/App/Assets.xcassets/AppIcon.appiconset with a 1024x1024 App Store icon before uploading. See docs/TESTFLIGHT_SETUP.md."
+            exit 1
+          fi
+
+      - name: Load personally supplied build inputs
+        if: env.FROM_UPLOAD == 'true'
+        uses: actions/checkout@v4
+        with:
+          ref: build-inputs
+          path: uploaded-inputs
+          persist-credentials: false
+
+      - name: Connect to game file server
+        if: env.FROM_UPLOAD != 'true'
+        uses: tailscale/github-action@v4
+        with:
+          authkey: ${{ secrets.TS_AUTHKEY }}
+
+      - name: Prepare build inputs from upload
+        if: env.FROM_UPLOAD == 'true'
+        run: |
+          python3 app/Scripts/assemble_inputs.py --inputs uploaded-inputs --out "$RUNNER_TEMP/game-files"
+
+      - name: Prepare build inputs from Tailscale server
+        if: env.FROM_UPLOAD != 'true'
+        run: |
+          python3 app/Scripts/fetch_game_files.py --server "$SERVER" --out "$RUNNER_TEMP/game-files"
+
+      - name: Select supported Xcode and install tools
+        run: |
+          xcodebuild -version
+          brew install xcodegen
+          if ! xcrun -sdk iphoneos metal --version > /dev/null 2>&1; then
+            xcodebuild -downloadComponent MetalToolchain
+          fi
+
+      - name: Import Apple Distribution certificate
+        uses: Apple-Actions/import-codesign-certs@v7
+        with:
+          p12-file-base64: ${{ secrets.APPSTORE_CERTIFICATES_FILE_BASE64 }}
+          p12-password: ${{ secrets.APPSTORE_CERTIFICATES_PASSWORD }}
+
+      - name: Download App Store provisioning profile
+        id: profiles
+        uses: Apple-Actions/download-provisioning-profiles@v6
+        with:
+          bundle-id: ${{ vars.APP_BUNDLE_ID }}
+          profile-type: IOS_APP_STORE
+          issuer-id: ${{ vars.APPSTORE_ISSUER_ID }}
+          api-key-id: ${{ vars.APPSTORE_API_KEY_ID }}
+          api-private-key: ${{ secrets.APPSTORE_API_PRIVATE_KEY }}
+
+      - name: Select provisioning profile
+        id: signing
+        env:
+          PROFILES_JSON: ${{ steps.profiles.outputs.profiles }}
+        run: |
+          PROFILE_NAME="$(jq -r '[.[] | select(.type == "IOS_APP_STORE")][0].name // empty' <<< "$PROFILES_JSON")"
+          if [ -z "$PROFILE_NAME" ]; then
+            echo "::error::No active IOS_APP_STORE provisioning profile found for $BUNDLE_ID."
+            exit 1
+          fi
+          echo "profile_name=$PROFILE_NAME" >> "$GITHUB_OUTPUT"
+
+      - name: Prepare iOS source, native WebAssembly engine and Metal shaders
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          python3 app/Scripts/check_game_files.py --mirror "$RUNNER_TEMP/game-files"
+          if gh release download shadertool-1 --repo "${{ github.repository }}" --pattern pgmsl-macos-arm64.tar.gz --dir "$RUNNER_TEMP" 2>/dev/null; then
+            echo "PGMSL_PREBUILT_URL=file://$RUNNER_TEMP/pgmsl-macos-arm64.tar.gz" >> "$GITHUB_ENV"
+          fi
+          python3 - <<'PY'
+          import os
+          from pathlib import Path
+          spec = Path("app/project.yml")
+          content = spec.read_text()
+          old = "PRODUCT_BUNDLE_IDENTIFIER: io.github.playgta5ios.app"
+          if content.count(old) != 1:
+              raise SystemExit("Expected bundle identifier setting not found in app/project.yml")
+          content = content.replace(old, "PRODUCT_BUNDLE_IDENTIFIER: " + os.environ["BUNDLE_ID"])
+          build_number = int(os.environ["GITHUB_RUN_NUMBER"]) * 100 + int(os.environ["GITHUB_RUN_ATTEMPT"])
+          old_version = 'CFBundleVersion: "4"'
+          if content.count(old_version) != 1:
+              raise SystemExit("Expected build number setting not found in app/project.yml")
+          content = content.replace(old_version, f'CFBundleVersion: "{build_number}"')
+          spec.write_text(content)
+          PY
+          (cd app && /usr/bin/python3 Scripts/prepare.py --mirror "$RUNNER_TEMP/game-files")
+          /usr/libexec/PlistBuddy -c "Set :CFBundleVersion $((GITHUB_RUN_NUMBER * 100 + GITHUB_RUN_ATTEMPT))" app/App/Info.plist
+          /usr/libexec/PlistBuddy -c "Set :PGDefaultAssetServer $SERVER" app/App/Info.plist
+
+      - name: Archive signed app
+        env:
+          PROFILE_NAME: ${{ steps.signing.outputs.profile_name }}
+          JOBS: "2"
+        run: |
+          set -euo pipefail
+          cd app
+          xcodebuild archive \
+            -project PlayGTA5Native.xcodeproj \
+            -scheme PlayGTA5Native \
+            -configuration Release \
+            -sdk iphoneos \
+            -destination 'generic/platform=iOS' \
+            -archivePath "$RUNNER_TEMP/PlayGTA5Native.xcarchive" \
+            -derivedDataPath Build/TestFlight \
+            -jobs "$JOBS" \
+            DEVELOPMENT_TEAM="$TEAM_ID" \
+            PRODUCT_BUNDLE_IDENTIFIER="$BUNDLE_ID" \
+            CODE_SIGN_STYLE=Manual \
+            CODE_SIGN_IDENTITY="Apple Distribution" \
+            PROVISIONING_PROFILE_SPECIFIER="$PROFILE_NAME" \
+            CODE_SIGN_ENTITLEMENTS=App/Free.entitlements \
+            ASSETCATALOG_COMPILER_APPICON_NAME=AppIcon \
+            GCC_OPTIMIZATION_LEVEL=2 \
+            SWIFT_OPTIMIZATION_LEVEL=-O \
+            DEBUG_INFORMATION_FORMAT=dwarf \
+            > "$RUNNER_TEMP/testflight-archive.log" 2>&1 || {
+              grep -E 'error:|ARCHIVE FAILED' "$RUNNER_TEMP/testflight-archive.log" | tail -40 || true
+              exit 1
+            }
+          echo "Signed archive completed."
+
+      - name: Export signed IPA for App Store Connect
+        id: export
+        env:
+          PROFILE_NAME: ${{ steps.signing.outputs.profile_name }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import os, plistlib
+          from pathlib import Path
+          options = {
+              "method": "app-store-connect",
+              "signingStyle": "manual",
+              "teamID": os.environ["TEAM_ID"],
+              "provisioningProfiles": {os.environ["BUNDLE_ID"]: os.environ["PROFILE_NAME"]},
+              "destination": "export",
+          }
+          with Path(os.environ["RUNNER_TEMP"], "ExportOptions.plist").open("wb") as f:
+              plistlib.dump(options, f)
+          PY
+          xcodebuild -exportArchive \
+            -archivePath "$RUNNER_TEMP/PlayGTA5Native.xcarchive" \
+            -exportPath "$RUNNER_TEMP/TestFlightExport" \
+            -exportOptionsPlist "$RUNNER_TEMP/ExportOptions.plist" \
+            > "$RUNNER_TEMP/testflight-export.log" 2>&1 || {
+              grep -E 'error:|EXPORT FAILED' "$RUNNER_TEMP/testflight-export.log" | tail -40 || true
+              exit 1
+            }
+          IPA_PATH="$(find "$RUNNER_TEMP/TestFlightExport" -maxdepth 1 -type f -name '*.ipa' -print -quit)"
+          if [ -z "$IPA_PATH" ]; then
+            echo "::error::Xcode exported no IPA."
+            exit 1
+          fi
+          echo "ipa_path=$IPA_PATH" >> "$GITHUB_OUTPUT"
+
+      - name: Upload build to Apple TestFlight
+        uses: Apple-Actions/upload-testflight-build@v5
+        with:
+          app-path: ${{ steps.export.outputs.ipa_path }}
+          issuer-id: ${{ vars.APPSTORE_ISSUER_ID }}
+          api-key-id: ${{ vars.APPSTORE_API_KEY_ID }}
+          api-private-key: ${{ secrets.APPSTORE_API_PRIVATE_KEY }}
+          wait-for-processing: 'false'
+
+      - name: Upload diagnostic logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: testflight-build-logs
+          path: |
+            ${{ runner.temp }}/testflight-archive.log
+            ${{ runner.temp }}/testflight-export.log
+            app/Build/xcodebuild.log
+          if-no-files-found: ignore
+          retention-days: 3
