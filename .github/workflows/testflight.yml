@@ -91,6 +91,12 @@ jobs:
       - name: Select supported Xcode and install tools
         run: |
           xcodebuild -version
+          SDK_VERSION="$(xcrun --sdk iphoneos --show-sdk-version)"
+          SDK_MAJOR="${SDK_VERSION%%.*}"
+          if [ "$SDK_MAJOR" -lt 26 ]; then
+            echo "::error::App Store Connect requires iOS SDK 26 or newer; found $SDK_VERSION."
+            exit 1
+          fi
           brew install xcodegen
           if ! xcrun -sdk iphoneos metal --version > /dev/null 2>&1; then
             xcodebuild -downloadComponent MetalToolchain
@@ -104,7 +110,7 @@ jobs:
 
       - name: Download App Store provisioning profile
         id: profiles
-        uses: Apple-Actions/download-provisioning-profiles@v6
+        uses: Apple-Actions/download-provisioning-profiles@v7
         with:
           bundle-id: ${{ vars.APP_BUNDLE_ID }}
           profile-type: IOS_APP_STORE
