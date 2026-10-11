@@ -57,12 +57,17 @@ jobs:
 
       - uses: actions/checkout@v4
 
-      - name: Check App Store icon prerequisites
+      - name: Prepare the app icon
         run: |
-          if [ ! -f app/App/Assets.xcassets/AppIcon.appiconset/Contents.json ]; then
-            echo "::error::Add app/App/Assets.xcassets/AppIcon.appiconset with a 1024x1024 App Store icon before uploading. See docs/TESTFLIGHT_SETUP.md."
-            exit 1
-          fi
+          set -euo pipefail
+          ICON_DIR="app/App/Assets.xcassets/AppIcon.appiconset"
+          test -f "$ICON_DIR/Contents.json"
+          test -f "$ICON_DIR/IconSource.jpg"
+          # Convert the approved icon source to an opaque 1024x1024 PNG.
+          sips -s format png --resampleHeightWidth 1024 1024 \
+            "$ICON_DIR/IconSource.jpg" --out "$ICON_DIR/AppIcon-1024.png" >/dev/null
+          test -s "$ICON_DIR/AppIcon-1024.png"
+          sips -g pixelWidth -g pixelHeight "$ICON_DIR/AppIcon-1024.png"
 
       - name: Load personally supplied build inputs
         if: env.FROM_UPLOAD == 'true'
