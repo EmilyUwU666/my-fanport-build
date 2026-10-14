@@ -49,7 +49,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: EmilyUwU666/muguet
-          ref: 9f0e45c21e495018b0ec57daed912f64925da20d
+          ref: aafd516db6fbf99e91959e21896eddba66727f8e
           path: muguet
           persist-credentials: false
 
