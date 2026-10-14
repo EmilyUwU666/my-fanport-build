@@ -24,6 +24,9 @@ jobs:
     env:
       BUNDLE_ID: ${{ vars.APP_BUNDLE_ID }}
       TEAM_ID: ${{ vars.APPLE_TEAM_ID }}
+      # Wasmtime serializes the iOS memory reservation into game.cwasm.
+      # The host precompiler and the iOS executable MUST use the same value.
+      MUGUET_IOS_HEAP_GB: "8"
     steps:
       - name: Check Apple credentials and private repository
         env:
@@ -182,7 +185,14 @@ jobs:
           ./target/release/muguet --precompile-ios target/ios-game/game.patched.wasm target/ios-game/game.cwasm
           test -s target/ios-game/game.cwasm
           echo "MUGUET_GAME_CODE=$PWD/target/ios-game/game.cwasm" >> "$GITHUB_ENV"
-          echo "MUGUET_IOS_HEAP_GB=8" >> "$GITHUB_ENV"
+
+      - name: Confirm precompile and runtime memory configuration
+        working-directory: muguet
+        run: |
+          set -euo pipefail
+          test "$MUGUET_IOS_HEAP_GB" = 8
+          test -s target/ios-game/game.cwasm
+          echo "Compiling Muguet iOS with the same ${MUGUET_IOS_HEAP_GB} GiB memory reservation used for Wasmtime precompilation."
 
       - name: Compile Muguet iOS app
         working-directory: muguet
