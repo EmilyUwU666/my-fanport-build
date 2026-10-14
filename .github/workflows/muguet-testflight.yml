@@ -1,0 +1,235 @@
+# Experimental replacement engine. Original Internal TestFlight is intentionally unchanged.
+name: Muguet TestFlight (experimental)
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: muguet-testflight-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build-and-upload:
+    name: Build Muguet and upload to TestFlight
+    runs-on: macos-26
+    timeout-minutes: 240
+    env:
+      BUNDLE_ID: ${{ vars.APP_BUNDLE_ID }}
+      TEAM_ID: ${{ vars.APPLE_TEAM_ID }}
+    steps:
+      - name: Check Apple credentials and private repository
+        env:
+          ISSUER_ID: ${{ vars.APPSTORE_ISSUER_ID }}
+          API_KEY_ID: ${{ vars.APPSTORE_API_KEY_ID }}
+          API_PRIVATE_KEY: ${{ secrets.APPSTORE_API_PRIVATE_KEY }}
+          P12_BASE64: ${{ secrets.APPSTORE_CERTIFICATES_FILE_BASE64 }}
+          P12_PASSWORD: ${{ secrets.APPSTORE_CERTIFICATES_PASSWORD }}
+        run: |
+          set -euo pipefail
+          test "${{ github.event.repository.private }}" = true || { echo "::error::Keep the engine-embedding build private."; exit 1; }
+          for name in BUNDLE_ID TEAM_ID ISSUER_ID API_KEY_ID API_PRIVATE_KEY P12_BASE64 P12_PASSWORD; do
+            test -n "${!name}" || { echo "::error::Missing Actions secret/variable: $name"; exit 1; }
+          done
+
+      - name: Check out build scripts
+        uses: actions/checkout@v4
+
+      - name: Check out pinned Muguet source
+        uses: actions/checkout@v4
+        with:
+          repository: EmilyUwU666/muguet
+          ref: cf20b2397ab3cc6c5daf738cbdce9bfc81f42534
+          path: muguet
+          persist-credentials: false
+
+      - name: Check out uploaded build inputs
+        uses: actions/checkout@v4
+        with:
+          ref: build-inputs
+          path: uploaded-inputs
+          persist-credentials: false
+
+      - name: Reassemble the uploaded game engine and verify its checksum
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json, hashlib, os
+          from pathlib import Path
+          root = Path("uploaded-inputs/inputs")
+          entries = [x for x in json.loads((root/"files.json").read_text())["files"] if x["name"] == "game.wasm"]
+          if len(entries) != 1:
+              raise SystemExit("game.wasm missing or ambiguous")
+          item = entries[0]
+          digest = hashlib.sha256()
+          dest = Path(os.environ["RUNNER_TEMP"]) / "muguet-game.wasm"
+          with dest.open("wb") as output:
+              for part in item["parts"]:
+                  with (root/part).open("rb") as src:
+                      while chunk := src.read(4*1024*1024):
+                          digest.update(chunk)
+                          output.write(chunk)
+          if digest.hexdigest() != item["sha256"]:
+              raise SystemExit("game.wasm failed checksum verification")
+          print("Validated personally supplied game.wasm", dest.stat().st_size, "bytes")
+          PY
+
+      - name: Install iOS and Rust build tools
+        run: |
+          set -euo pipefail
+          xcodebuild -version
+          brew install xcodegen
+          export PATH="$HOME/.cargo/bin:/opt/homebrew/bin:$PATH"
+          if ! command -v rustup >/dev/null 2>&1; then brew install rustup; fi
+          rustup toolchain install 1.98.1 --profile minimal
+          rustup target add aarch64-apple-ios --toolchain 1.98.1
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+          echo "/opt/homebrew/bin" >> "$GITHUB_PATH"
+
+      - name: Import iOS distribution certificate
+        id: certificate
+        uses: Apple-Actions/import-codesign-certs@v7
+        with:
+          p12-file-base64: ${{ secrets.APPSTORE_CERTIFICATES_FILE_BASE64 }}
+          p12-password: ${{ secrets.APPSTORE_CERTIFICATES_PASSWORD }}
+
+      - name: Choose signing identity
+        id: identity
+        env:
+          IDENTITIES: ${{ steps.certificate.outputs.identities }}
+        run: |
+          set -euo pipefail
+          HASH="$(jq -r '[.[] | select(.name | test("^(Apple Distribution|iPhone Distribution)(:|$)"))][0].hash // empty' <<< "$IDENTITIES")"
+          test -n "$HASH" || { echo "::error::No matching iOS distribution signing identity in P12"; exit 1; }
+          echo "hash=$HASH" >> "$GITHUB_OUTPUT"
+
+      - name: Download App Store provisioning profiles
+        id: profiles
+        uses: Apple-Actions/download-provisioning-profiles@v7
+        with:
+          bundle-id: ${{ vars.APP_BUNDLE_ID }}
+          profile-type: IOS_APP_STORE
+          issuer-id: ${{ vars.APPSTORE_ISSUER_ID }}
+          api-key-id: ${{ vars.APPSTORE_API_KEY_ID }}
+          api-private-key: ${{ secrets.APPSTORE_API_PRIVATE_KEY }}
+
+      - name: Select profile and check increased-memory entitlements
+        id: profile
+        env:
+          PROFILES: ${{ steps.profiles.outputs.profiles }}
+        run: |
+          set -euo pipefail
+          PROFILE_NAME="$(jq -r '[.[] | select(.type == "IOS_APP_STORE") | select(.name == "FivePort App Store")][0].name // [.[] | select(.type == "IOS_APP_STORE")][0].name // empty' <<< "$PROFILES")"
+          test -n "$PROFILE_NAME" || { echo "::error::No iOS App Store provisioning profile for this Bundle ID"; exit 1; }
+          echo "name=$PROFILE_NAME" >> "$GITHUB_OUTPUT"
+          export PROFILE_NAME
+          python3 - <<'PY'
+          import glob, os, plistlib, subprocess, sys
+          needed = ("com.apple.developer.kernel.extended-virtual-addressing", "com.apple.developer.kernel.increased-memory-limit")
+          found = False
+          for file in glob.glob(os.path.expanduser("~/Library/MobileDevice/Provisioning Profiles/*.mobileprovision")):
+              decoded = subprocess.run(["security","cms","-D","-i",file],capture_output=True)
+              if decoded.returncode: continue
+              try: profile = plistlib.loads(decoded.stdout)
+              except Exception: continue
+              if profile.get("Name") != os.environ["PROFILE_NAME"]: continue
+              found = True
+              ent = profile.get("Entitlements", {})
+              missing = [name for name in needed if ent.get(name) is not True]
+              if missing:
+                  print("::error::Regenerate this provisioning profile to include: " + ", ".join(missing))
+                  sys.exit(1)
+              print("Both requested Muguet memory entitlements are in the selected profile.")
+              break
+          if not found:
+              print("::warning::Provisioning profile could not be inspected; Xcode will validate entitlements.")
+          PY
+
+      - name: Patch and precompile engine for iPhone
+        working-directory: muguet
+        run: |
+          set -euo pipefail
+          cargo +1.98.1 build --release --locked
+          mkdir -p target/ios-game
+          ./target/release/muguet --patch "$RUNNER_TEMP/muguet-game.wasm" target/ios-game/game.patched.wasm
+          ./target/release/muguet --precompile-ios target/ios-game/game.patched.wasm target/ios-game/game.cwasm
+          test -s target/ios-game/game.cwasm
+          echo "MUGUET_GAME_CODE=$PWD/target/ios-game/game.cwasm" >> "$GITHUB_ENV"
+          echo "MUGUET_IOS_HEAP_GB=8" >> "$GITHUB_ENV"
+
+      - name: Compile Muguet iOS app
+        working-directory: muguet
+        run: |
+          set -euo pipefail
+          IPHONEOS_DEPLOYMENT_TARGET=15.0 cargo +1.98.1 build --release --locked --no-default-features \
+            --target aarch64-apple-ios --target-dir target/ios
+          test -s target/ios/aarch64-apple-ios/release/muguet
+          (cd ios && xcodegen generate --quiet)
+          /usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString 1.3.0" ios/Info.plist
+          /usr/libexec/PlistBuddy -c "Set :CFBundleVersion $((GITHUB_RUN_NUMBER * 1000 + GITHUB_RUN_ATTEMPT))" ios/Info.plist
+
+      - name: Archive signed Muguet app
+        working-directory: muguet
+        env:
+          PROFILE_NAME: ${{ steps.profile.outputs.name }}
+          IDENTITY_HASH: ${{ steps.identity.outputs.hash }}
+        run: |
+          set -euo pipefail
+          xcodebuild archive -project ios/Muguet.xcodeproj -scheme Muguet \
+            -configuration Release -sdk iphoneos -destination 'generic/platform=iOS' \
+            -archivePath "$RUNNER_TEMP/Muguet.xcarchive" -derivedDataPath target/ios-xcode \
+            DEVELOPMENT_TEAM="$TEAM_ID" PRODUCT_BUNDLE_IDENTIFIER="$BUNDLE_ID" \
+            CODE_SIGN_STYLE=Manual CODE_SIGN_IDENTITY="$IDENTITY_HASH" \
+            PROVISIONING_PROFILE_SPECIFIER="$PROFILE_NAME" \
+            CODE_SIGN_ENTITLEMENTS=Muguet.entitlements \
+            > "$RUNNER_TEMP/muguet-archive.log" 2>&1 || {
+              grep -E 'error:|ARCHIVE FAILED' "$RUNNER_TEMP/muguet-archive.log" | tail -40 || true
+              exit 1
+            }
+
+      - name: Export App Store Connect IPA
+        id: export
+        env:
+          PROFILE_NAME: ${{ steps.profile.outputs.name }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import os, plistlib
+          from pathlib import Path
+          options = {"method":"app-store-connect","signingStyle":"manual","teamID":os.environ["TEAM_ID"],
+                     "provisioningProfiles":{os.environ["BUNDLE_ID"]:os.environ["PROFILE_NAME"]},"destination":"export"}
+          with (Path(os.environ["RUNNER_TEMP"])/"MuguetExportOptions.plist").open("wb") as f:
+              plistlib.dump(options,f)
+          PY
+          xcodebuild -exportArchive -archivePath "$RUNNER_TEMP/Muguet.xcarchive" \
+            -exportPath "$RUNNER_TEMP/MuguetExport" \
+            -exportOptionsPlist "$RUNNER_TEMP/MuguetExportOptions.plist" \
+            > "$RUNNER_TEMP/muguet-export.log" 2>&1 || {
+              grep -E 'error:|EXPORT FAILED' "$RUNNER_TEMP/muguet-export.log" | tail -40 || true
+              exit 1
+            }
+          IPA="$(find "$RUNNER_TEMP/MuguetExport" -maxdepth 1 -name '*.ipa' -type f -print -quit)"
+          test -n "$IPA" || { echo "::error::Xcode exported no IPA"; exit 1; }
+          echo "ipa=$IPA" >> "$GITHUB_OUTPUT"
+
+      - name: Upload Muguet IPA to TestFlight
+        uses: Apple-Actions/upload-testflight-build@v5
+        with:
+          app-path: ${{ steps.export.outputs.ipa }}
+          issuer-id: ${{ vars.APPSTORE_ISSUER_ID }}
+          api-key-id: ${{ vars.APPSTORE_API_KEY_ID }}
+          api-private-key: ${{ secrets.APPSTORE_API_PRIVATE_KEY }}
+          wait-for-processing: 'false'
+
+      - name: Upload diagnostic logs if build fails
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: muguet-testflight-diagnostics
+          path: |
+            ${{ runner.temp }}/muguet-archive.log
+            ${{ runner.temp }}/muguet-export.log
+          if-no-files-found: ignore
+          retention-days: 3
