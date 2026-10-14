@@ -45,6 +45,26 @@ jobs:
           path: muguet
           persist-credentials: false
 
+      - name: Use the approved FivePort app icon
+        run: |
+          set -euo pipefail
+          SOURCE="app/App/Assets.xcassets/AppIcon.appiconset/IconSource.jpg"
+          ICON="muguet/ios/Assets.xcassets/AppIcon.appiconset"
+          test -s "$SOURCE"
+          mkdir -p "$ICON"
+          sips -s format png --resampleHeightWidth 1024 1024 "$SOURCE" --out "$ICON/AppIcon-1024.png" >/dev/null
+          cp app/App/Assets.xcassets/AppIcon.appiconset/Contents.json "$ICON/Contents.json"
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path("muguet/ios/project.yml")
+          data = p.read_text()
+          source = "      - path: ../assets/muguet.icon"
+          setting = "ASSETCATALOG_COMPILER_APPICON_NAME: muguet"
+          if data.count(source) != 1 or data.count(setting) != 1:
+              raise SystemExit("Unexpected Muguet icon configuration")
+          p.write_text(data.replace(source, "      - path: Assets.xcassets").replace(setting, "ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon"))
+          PY
+
       - name: Check out uploaded build inputs
         uses: actions/checkout@v4
         with:
